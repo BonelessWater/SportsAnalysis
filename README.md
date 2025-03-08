@@ -39,5 +39,26 @@ brainstorming ai:
     - can both be used but for different scenarios; news sentiment & regular buy-sell model
 
 
+Weird set-up
+
+To fix the MRO error, you need to patch the pytorch‑forecasting source code that defines the combined callback. In your environment, locate the file:
+
+vbnet
+Copy
+venv\lib\site-packages\pytorch_forecasting\models\temporal_fusion_transformer\tuning.py
+Then find the class definition that currently looks like this:
+
+python
+Copy
+class PyTorchLightningPruningCallbackAdjusted(pl.Callback, PyTorchLightningPruningCallback):
+    ...
+Change the inheritance order so that the Optuna integration callback comes first:
+
+python
+Copy
+class PyTorchLightningPruningCallbackAdjusted(PyTorchLightningPruningCallback, pl.Callback):
+    ...
+Save the file and re-run your script. This swap resolves the inconsistent method resolution order error by ensuring that the MRO is defined in a consistent way.
+
 
 

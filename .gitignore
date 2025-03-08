@@ -3,3 +3,5 @@ venv
 
 # All sports data
 *.db
+
+lightning_logs
