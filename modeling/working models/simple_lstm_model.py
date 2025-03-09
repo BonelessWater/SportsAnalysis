@@ -22,7 +22,13 @@ class SimpleLSTM(pl.LightningModule):
         return self.fc(lstm_out[:, -1, :])
     
     def training_step(self, batch, batch_idx):
-        x, y = batch
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        x = batch["encoder_cont"]
+        # Use the decoder target (which holds the future target "Promotions")
+        y = batch.get("decoder_target")
+        if y is None:
+            raise KeyError(f"'decoder_target' not found in batch; available keys: {list(batch.keys())}")
         y_hat = self(x)
         loss = F.mse_loss(y_hat, y)
         self.log("train_loss", loss)
@@ -30,13 +36,6 @@ class SimpleLSTM(pl.LightningModule):
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
-
-# A custom collate function is sometimes needed to structure the batch.
-def collate_fn(batch):
-    # Here we assume each element in the batch is a dict containing 'encoder_cont' and 'target'
-    x = torch.stack([b["encoder_cont"] for b in batch])
-    y = torch.stack([b["target"] for b in batch])
-    return x, y
 
 def main():
     # Read and preprocess data
@@ -73,14 +72,16 @@ def main():
         add_encoder_length=True,
     )
     
-    # Create dataloader with a custom collate function
+    # Create dataloader using the default collate function
     batch_size = 32
-    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0, collate_fn=collate_fn)
+    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=16
+    )
     
     # Determine input size from a sample batch
     sample_batch = next(iter(train_dataloader))
-    x_sample, _ = sample_batch
-    input_size = x_sample.shape[-1]
+    if isinstance(sample_batch, tuple):
+        sample_batch = sample_batch[0]
+    input_size = sample_batch["encoder_cont"].shape[-1]
     
     # Instantiate the LSTM model
     lstm_model = SimpleLSTM(input_size=input_size, hidden_size=16, num_layers=1, lr=0.03)
@@ -91,13 +92,15 @@ def main():
     
     # For prediction, create a dataloader from the dataset with predict=True
     future_data = TimeSeriesDataSet.from_dataset(training, data, predict=True)
-    future_dataloader = future_data.to_dataloader(train=False, batch_size=batch_size, num_workers=0, collate_fn=collate_fn)
+    future_dataloader = future_data.to_dataloader(train=False, batch_size=batch_size, num_workers=16)
     
     predictions = []
     lstm_model.eval()
     with torch.no_grad():
         for batch in future_dataloader:
-            x, _ = batch
+            if isinstance(batch, tuple):
+                batch = batch[0]
+            x = batch["encoder_cont"]
             preds = lstm_model(x)
             predictions.append(preds)
     predictions = torch.cat(predictions, dim=0)
