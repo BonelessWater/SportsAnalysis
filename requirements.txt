@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cu117
+
+lightning==2.0.0
+pytorch-forecasting==1.0.0
+
+pandas
+numpy<2
+torchmetrics
+optuna
+optuna-integration
+tensorboard
+tensorflow
+pyunpack
+wget
