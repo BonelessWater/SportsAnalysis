@@ -23,8 +23,8 @@ class SimpleLSTM(pl.LightningModule):
         super().__init__()
         self.lr = lr
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, 1)  # Forecasting a single value
-    
+        self.fc = nn.Linear(hidden_size, 1)  # Forecast a single value
+
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
         # Use the output from the last time step
@@ -34,13 +34,24 @@ class SimpleLSTM(pl.LightningModule):
         if isinstance(batch, tuple):
             batch = batch[0]
         x = batch["encoder_cont"]
-        # Use the decoder target (which holds the future target "Promotions")
         y = batch.get("decoder_target")
         if y is None:
             raise KeyError(f"'decoder_target' not found in batch; available keys: {list(batch.keys())}")
         y_hat = self(x)
         loss = F.mse_loss(y_hat, y)
         self.log("train_loss", loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        x = batch["encoder_cont"]
+        y = batch.get("decoder_target")
+        if y is None:
+            raise KeyError(f"'decoder_target' not found in batch; available keys: {list(batch.keys())}")
+        y_hat = self(x)
+        loss = F.mse_loss(y_hat, y)
+        self.log("val_loss", loss, prog_bar=True)
         return loss
     
     def configure_optimizers(self):
