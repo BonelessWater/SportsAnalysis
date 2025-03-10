@@ -1,7 +1,10 @@
 .env
 venv
 
-outputs/data/
+# data
+electricity/
+favorita/
+traffic/
 
 __pycache__
 lightning_logs
