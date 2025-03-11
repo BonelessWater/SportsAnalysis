@@ -2,8 +2,6 @@ import argparse
 import pandas as pd
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import lightning.pytorch as pl
 
 from LSTM import SimpleLSTM
@@ -21,7 +19,26 @@ from pytorch_forecasting.metrics import QuantileLoss, MAE, NormalDistributionLos
 # For metrics computations
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 
-def evaluate_dataloader(model, dataloader, model_name):
+import os
+import warnings
+
+# Environment variables
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+warnings.filterwarnings("ignore", message="Attribute 'loss' is an instance of `nn.Module`")
+
+# -----------------------------------------------------------
+# Override the TFT plotting to avoid negative errorbars error
+# -----------------------------------------------------------
+class MyTFT(TemporalFusionTransformer):
+    def plot_prediction(self, x, out, idx=None, add_loss_to_title=False, **kwargs):
+        # Instead of plotting predictions (which triggers the error due to negative error bars),
+        # simply return None so that logging doesn't try to plot.
+        return None
+
+# -----------------------------------------------------------
+# Evaluation function (unchanged)
+# -----------------------------------------------------------
+def evaluate_dataloader(model, dataloader, model_name, prediction_length):
     """
     Evaluate the given dataloader using the provided model.
     Returns flattened numpy arrays for predictions and targets.
@@ -31,11 +48,9 @@ def evaluate_dataloader(model, dataloader, model_name):
     model.eval()
     with torch.no_grad():
         for batch in dataloader:
-            # If the batch is a tuple, take the first element (the dictionary)
             if isinstance(batch, tuple):
                 batch = batch[0]
-            # For Baseline, pass the entire batch
-            if model_name == "Baseline":
+            if model_name in ["Baseline", "DeepAR", "RecurrentNetwork"] or "encoder_lengths" in batch:
                 preds = model(batch)
             else:
                 if "encoder_cont" in batch:
@@ -45,86 +60,108 @@ def evaluate_dataloader(model, dataloader, model_name):
                 else:
                     raise KeyError("No appropriate input found in batch.")
                 preds = model(x)
-            # If output is not a tensor, extract underlying tensor (e.g. from a 'prediction' attribute)
             if not isinstance(preds, torch.Tensor) and hasattr(preds, "prediction"):
                 preds = preds.prediction
+
+            # If predictions have an extra sample dimension, aggregate it
+            if preds.ndim == 3:
+                if preds.shape[1] == prediction_length:
+                    preds = preds.mean(axis=-1)
+                else:
+                    preds = preds.mean(axis=1)
             all_preds.append(preds.cpu().numpy())
-            # Retrieve targets
+
             if "decoder_target" in batch:
-                all_targets.append(batch["decoder_target"].cpu().numpy())
+                target_array = batch["decoder_target"].cpu().numpy()
             elif "target" in batch:
-                all_targets.append(batch["target"].cpu().numpy())
+                target_array = batch["target"].cpu().numpy()
+                if target_array.ndim > 1 and target_array.shape[1] != prediction_length:
+                    target_array = target_array[:, -prediction_length:]
             else:
                 raise KeyError("No target found in batch.")
+            all_targets.append(target_array)
+            
     all_preds = np.concatenate(all_preds, axis=0).flatten()
     all_targets = np.concatenate(all_targets, axis=0).flatten()
     return all_preds, all_targets
 
-def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, batch_size: int = 2):
+def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, batch_size: int = 32, full_data: bool = False):
     """
-    Runs the specified forecasting model on the given dataset.
+    Runs the specified forecasting model on the electricity dataset.
     After training (or baseline prediction), the model is evaluated on both the training and validation sets.
-    Performance metrics (MAE, MSE, RMSE, MASE, and AUC ROC if applicable) are computed and printed.
-    The trained model is then saved to disk.
-    
-    Args:
-        model_name (str): Name of the model to use. Options are:
-            "Baseline", "TemporalFusionTransformer", "DeepAR", "NBeats", "NHiTS",
-            "DecoderMLP", "RecurrentNetwork", "LSTM".
-        data_path (str): Path to the CSV file.
-        max_epochs (int): Number of training epochs.
-        batch_size (int): Batch size.
+    Performance metrics are computed and printed, and the trained model is saved.
     """
     # Read the CSV file and pre-process
     data = pd.read_csv(data_path, index_col=0)
+    
+    # For NBeats and NHiTS, the models require a forecast horizon >1 and no additional known inputs.
+    if not full_data:
+        if model_name in ["NBeats", "NHiTS"]:
+            print("Using a forecast horizon of 32 for NBeats/NHiTS for faster testing.")
+            max_encoder_length = 32
+            max_prediction_length = 32
+            # No subsetting of rows here so that the time series remain long enough.
+        else:
+            data = data.head(1000)
+            print("Using a subset of the data for faster testing.")
+            max_encoder_length = 6
+            max_prediction_length = 1
+    else:
+        # If using full data, use default encoder/prediction lengths.
+        if model_name in ["NBeats", "NHiTS"]:
+            max_encoder_length = 32
+            max_prediction_length = 32  # You may adjust as needed
+        else:
+            max_encoder_length = 12
+            max_prediction_length = 1
+
     data["date"] = pd.to_datetime(data["date"])
     data["t"] = data["t"].astype(int)
     data["time_idx"] = data["t"] - data["t"].min()
+    data["days_from_start"] = (data["date"] - data["date"].min()).dt.days
 
     # Convert categorical columns
     data["month"] = data["month"].astype(str).astype("category")
     data["categorical_day_of_week"] = data["categorical_day_of_week"].astype(str).astype("category")
     data["categorical_hour"] = data["categorical_hour"].astype(str).astype("category")
-    data["categorical_id"] = data["categorical_id"].astype(str).astype("category")  # For grouping
+    data["categorical_id"] = data["categorical_id"].astype(str).astype("category")
 
-    # Process the target variable
     data["power_usage"] = data["power_usage"].clip(lower=1e-8)
     data["log_power_usage"] = np.log(data["power_usage"])
     data["avg_power_usage_by_cat"] = data.groupby(
         ["time_idx", "categorical_id"], observed=True
     )["power_usage"].transform("mean")
 
-    # Define time series parameters
-    max_encoder_length = 12   # use the last 12 timesteps for encoding
-    max_prediction_length = 1  # forecast one timestep ahead
-
-    # Create dataset and select target column
+    # Create dataset based on the model type:
     if model_name in ["NBeats", "NHiTS"]:
+        # For these models, the only variable should be the target
         training = TimeSeriesDataSet(
             data,
             time_idx="time_idx",
-            target="Promotions",
-            group_ids=["Agency", "SKU"],
-            min_encoder_length=max_encoder_length,
-            max_encoder_length=max_encoder_length,
-            min_prediction_length=max_prediction_length,
-            max_prediction_length=max_prediction_length,
-            time_varying_unknown_reals=["Promotions"],
-            target_normalizer=GroupNormalizer(groups=["Agency", "SKU"], transformation=None),
-            add_target_scales=False,
-        )
-        target_col = "Promotions"
-    else:
-        training = TimeSeriesDataSet(
-            data,
-            time_idx="t",
             target="power_usage",
             group_ids=["categorical_id"],
             min_encoder_length=max_encoder_length,
             max_encoder_length=max_encoder_length,
             min_prediction_length=max_prediction_length,
             max_prediction_length=max_prediction_length,
-            time_varying_known_reals=["t", "days_from_start"],
+            time_varying_unknown_reals=["power_usage"],
+            target_normalizer=GroupNormalizer(groups=["categorical_id"], transformation=None),
+            add_relative_time_idx=False,
+            add_target_scales=False,
+            add_encoder_length=False,
+        )
+        target_col = "power_usage"
+    else:
+        training = TimeSeriesDataSet(
+            data,
+            time_idx="time_idx",
+            target="power_usage",
+            group_ids=["categorical_id"],
+            min_encoder_length=max_encoder_length,
+            max_encoder_length=max_encoder_length,
+            min_prediction_length=max_prediction_length,
+            max_prediction_length=max_prediction_length,
+            time_varying_known_reals=["time_idx", "days_from_start"],
             time_varying_known_categoricals=["month", "categorical_hour", "categorical_day_of_week"],
             time_varying_unknown_reals=["power_usage"],
             target_normalizer=GroupNormalizer(groups=["categorical_id"], transformation="softplus"),
@@ -134,13 +171,11 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
         )
         target_col = "power_usage"
 
-    # Create dataloaders
     num_workers = 16
     train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=num_workers)
     validation_dataset = TimeSeriesDataSet.from_dataset(training, data, stop_randomization=True)
     val_dataloader = validation_dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=num_workers)
     
-    # Set up callbacks and logging (for non-Baseline models)
     early_stop_callback = pl.callbacks.EarlyStopping(
         monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min"
     )
@@ -152,10 +187,11 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
         model = Baseline.from_dataset(training)
         future_data = TimeSeriesDataSet.from_dataset(training, data, predict=True)
         predictions = model.predict(future_data)
-        print("Baseline Predicted Promotions:")
+        print("Baseline Predictions:")
         print(predictions)
     elif model_name == "TemporalFusionTransformer":
-        model = TemporalFusionTransformer.from_dataset(
+        # Use the subclassed TFT to avoid plotting errors during validation
+        model = MyTFT.from_dataset(
             training,
             learning_rate=0.06,
             hidden_size=32,
@@ -164,7 +200,7 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
             hidden_continuous_size=8,
             output_size=7,  # default for quantile predictions
             loss=QuantileLoss(),
-            log_interval=10,
+            log_interval=0,  # disable logging predictions
             reduce_on_plateau_patience=4,
         )
     elif model_name == "DeepAR":
@@ -244,7 +280,7 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
     # -------------------------
     # Evaluate performance on the training set
     # -------------------------
-    train_preds, train_targets = evaluate_dataloader(model, train_dataloader, model_name)
+    train_preds, train_targets = evaluate_dataloader(model, train_dataloader, model_name, max_prediction_length)
     train_mae = mean_absolute_error(train_targets, train_preds)
     train_mse = mean_squared_error(train_targets, train_preds)
     train_rmse = np.sqrt(train_mse)
@@ -273,7 +309,7 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
     # -------------------------
     # Evaluate performance on the testing (validation) set
     # -------------------------
-    test_preds, test_targets = evaluate_dataloader(model, val_dataloader, model_name)
+    test_preds, test_targets = evaluate_dataloader(model, val_dataloader, model_name, max_prediction_length)
     test_mae = mean_absolute_error(test_targets, test_preds)
     test_mse = mean_squared_error(test_targets, test_preds)
     test_rmse = np.sqrt(test_mse)
@@ -294,7 +330,6 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
     else:
         print("AUC ROC : Not applicable for non-binary targets")
 
-    # Combine metrics in a dictionary if needed
     metrics = {
         "Training": {
             "MAE": train_mae,
@@ -315,27 +350,31 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
 
 def main():
     abbr_mapping = {
-        "TFT": "TemporalFusionTransformer",
-        "NBE": "NBeats",
-        "NHI": "NHiTS",
-        "LSTM": "LSTM",
-        "RN": "RecurrentNetwork",
-        "BL": "Baseline"
+        "TFT": "TemporalFusionTransformer",      # works
+        "LSTM": "LSTM",                          # works
+        "DAR": "DeepAR",                         # works
+        "DMLP": "DecoderMLP",                    # works
+        "RN": "RecurrentNetwork",                # works
+        "NBE": "NBeats",                         # added NBeats
+        "NHI": "NHiTS",                          # added NHiTS
+        "BL": "Baseline"                         # works
     }
     
-    parser = argparse.ArgumentParser(description="Run a PyTorch Forecasting model on a CSV dataset.")
+    parser = argparse.ArgumentParser(description="Run a PyTorch Forecasting model on an electricity CSV dataset.")
     parser.add_argument("--data_path", type=str,
                         default="../outputs/data/electricity/hourly_electricity.csv",
                         help="Path to the CSV data file")
     parser.add_argument("--model", type=str, default="LSTM", 
-                        help=("Model abbreviation to use. Options are: TFT, DAR, NBE, NHI, LSTM, DMLP, RN, BL"))
+                        help=("Model abbreviation to use. Options are: TFT, DAR, LSTM, DMLP, RN, NBE, NHI, BL"))
     parser.add_argument("--max_epochs", type=int, default=1, help="Number of training epochs") 
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training") 
+    parser.add_argument("--full_data", action="store_true", 
+                        help="If set, use the full dataset; otherwise, only a subset is loaded for faster testing")
     args = parser.parse_args()
     model_full_name = abbr_mapping.get(args.model.upper(), args.model)
     
     print(f"Running model: {model_full_name} on data: {args.data_path}")
-    preds, metrics = run_forecasting_model(model_full_name, args.data_path, max_epochs=args.max_epochs, batch_size=args.batch_size)
+    preds, metrics = run_forecasting_model(model_full_name, args.data_path, max_epochs=args.max_epochs, batch_size=args.batch_size, full_data=args.full_data)
     print("\nFinal Performance Metrics:")
     for phase in metrics:
         print(f"\n{phase} Metrics:")

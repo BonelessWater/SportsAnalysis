@@ -6,5 +6,8 @@ electricity/
 favorita/
 traffic/
 
+# models
+saved_models/
+
 __pycache__
 lightning_logs
