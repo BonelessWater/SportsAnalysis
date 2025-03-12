@@ -5,6 +5,7 @@ venv
 electricity/
 favorita/
 traffic/
+nba/
 
 # models
 saved_models/
