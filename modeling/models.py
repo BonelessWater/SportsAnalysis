@@ -137,6 +137,14 @@ def run_forecasting_model(model_name: str, data_path: str, max_epochs: int = 5, 
     data["home_team_ticker"] = data["home_team"].apply(lambda x: TEAM_NAME_TO_TICKER.get(x, x))
     data["home_team_ticker"] = data["home_team_ticker"].astype("category")
     
+    # Filter out rows with NA or infinite values in critical columns
+    cols_to_check = [
+        "home_avg_age", "home_avg_height", "home_avg_exp",
+        "visitor_avg_age", "visitor_avg_height", "visitor_avg_exp"
+    ]
+    data = data.replace([np.inf, -np.inf], np.nan)
+    data = data.dropna(subset=cols_to_check)
+    
     # Sort data by team and game_date, then create a sequential time index for each team
     data = data.sort_values(["home_team_ticker", "game_date"]).reset_index(drop=True)
     data["time_idx"] = data.groupby("home_team_ticker").cumcount() + 1
