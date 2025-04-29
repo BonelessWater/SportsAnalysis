@@ -1,7 +1,16 @@
 .env
 venv
 
-outputs/data/
+# data
+electricity/
+favorita/
+traffic/
+nba/
+*.db
+
+# models
+saved_models/
 
 __pycache__
 lightning_logs
+.vscode

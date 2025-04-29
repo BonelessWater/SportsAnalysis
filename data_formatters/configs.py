@@ -22,7 +22,6 @@ for the main experiments used in the publication.
 import os
 
 import data_formatters.electricity
-import data_formatters.favorita
 import data_formatters.traffic
 import data_formatters.volatility
 
